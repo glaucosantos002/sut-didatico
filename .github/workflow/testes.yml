@@ -5,11 +5,18 @@ on:
         paths-ignore: ['**/*.md', ' /docs/**']
     workflow_dispatch:
 
+env:
+    BASE_URL: 'http://localhost:3000'
+    MAESTRO_VERSION: '2.9.0'
+
 jobs:
     regressao:
         name: 'regressao'
         runs-on: ubuntu-latest
         timeout-minutes: 30
+        permissions:
+            contents: read
+            issues: write
         steps:
             - name: checkout do SUT
               uses: actions/checkout@v5
@@ -42,3 +49,95 @@ jobs:
               run: |
                 mkdir -p relatorios
                 npm run test:unidade
+
+            - name: sobe o SUT em segundo plano
+              working-directory: sut-didatico
+              run: nohup npm start > "$GITHUB_WORKSPACE/sut.log" 2>&1 &
+
+            - name: aguardar o SUT responder
+              run: |
+                for i in $(seq 1 60); do
+                    code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL/api/v1/demands" || true)
+                    if [ "$code" = "401" ] || [ "$code" = "200" ]; then
+                        echo "SUT respondeu em ${i}s (HTTP $code)"; exit 0
+                    fi
+                    sleep 1
+                done
+                echo "::error::SUT nao respondeu em 60s"
+                tail -n 50 "$GITHUB_WORKSPACE/sut.log" || echo "(log vazio)"
+                exit 1
+            
+            - name: suite de API
+              id: api
+              working-directory: tas
+              env:
+                NODE_OPTIONS: >-
+                    --test-reporter=spec --test-reporter-destination=stdout
+                    --test-reporter=junit --test-reporter-destination=relatorios/api.xml
+              run: |
+                mkdir -p relatorios
+                npm run test:api
+
+            - name: cache do maestro
+              uses: actions/cache@v5
+              with:
+                path: ~/maestro
+                key: maestro-${{ runner.os }}-${{ env.MAESTRO_VERSION }}
+            
+            - name: instala o Maestro
+              env:
+                MAESTRO_CLI_NO_ANALYTICS: '1'
+              run: |
+                export MAESTRO_VERSION="${{ env.MAESTRO_VERSION }}"
+                curl -Ls "https://get.maestro.mobile.dev" | bash
+                echo "$HOME/.maestro/bin" >> "$GITHUB_PATH"
+
+            - name: garante o display virtual
+              run: |
+                if ! command -v xvfb-run >/dev/null 2>&1; then
+                    sudo apt-get update -qq && sudo apt-get install -y xvfb
+                fi
+
+            - name: suite de e2e
+              id: e2e
+              working-directory: tas
+              run: |
+                mkdir -p relatorios
+                xvfb-run -a --server-args="-screen 0 1280x1024x24" \
+                maestro test tests/e2e/maestro \
+                --format junit \
+                --output relatorios/maestro-junit.xml
+            
+            - name: resumo dos estagios
+              if: always()
+              run: |
+               {
+                    echo "## Resultados"
+                    echo "| Suite | Resultado |"
+                    echo "|---|---|"
+                    echo "| unidade | ${{ steps.unidade.outcome }} |"
+                    echo "| api | ${{ steps.api.outcome }} |"
+                    echo "| e2e | ${{ steps.e2e.outcome }} |"
+                } >> "$GITHUB_STEP_SUMMARY"
+            
+            - name: publica evidencias
+              if: always()
+              uses: actions/upload-artifact@v6
+              with:
+                name: evidencias-testes-${{ github.run_id }}
+                path: |
+                    tas/relatorios/
+                    sut.log
+                retention-days: 14
+                if-no-files-found: warn
+
+            - name: abre item de manutencao
+              if: failure()
+              env:
+                GH_TOKEN: ${{ github.token }}
+                GH_REPO: ${{ github.repository }}
+              run: |
+                gh issue create \
+                    --title "A suite de regressão reprovou em $(date +%F)" \
+                    --body "Execucao: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+                    --label manutencao
